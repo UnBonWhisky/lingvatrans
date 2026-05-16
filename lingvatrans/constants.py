@@ -1,12 +1,19 @@
 # Default Bearer token (hardcoded in Lingvanex JS, can be overridden)
 DEFAULT_BEARER_TOKEN = 'Bearer a_25rccaCYcBC9ARqMODx2BV2M0wNZgDCEl3jryYSgYZtF1a702PVi4sxqi2AmZWyCcw4x209VXnCYwesx'
 
+# Chrome extension token (no Bearer prefix)
+CHROME_BEARER_TOKEN = 'Fujiwaranosai'
+
 DEFAULT_RAISE_EXCEPTION = False
 
-# API endpoints
+# Web platform API endpoints
 API_BASE_URL = 'https://api-b2b.backenster.com/b1/api/v3'
 TRANSLATE_URL = API_BASE_URL + '/translate/'
 GET_LANGUAGES_URL = API_BASE_URL + '/getLanguages'
+
+# Chrome extension API endpoints
+CHROME_API_BASE_URL = 'https://backenster.com/v2/api/v3'
+CHROME_TRANSLATE_URL = CHROME_API_BASE_URL + '/translate/'
 
 # Maps full_code (e.g. 'en_US') -> english name in lowercase
 LANGUAGES = {

@@ -3,8 +3,10 @@
 Lingvanex Translation API client.
 
 Provides async translate() and detect() methods backed by the
-Lingvanex B2B REST API (api-b2b.backenster.com).
+Lingvanex B2B REST API (api-b2b.backenster.com) or the Chrome extension API
+(backenster.com/v2).
 """
+import uuid as _uuid_mod
 import aiohttp
 import aiorwlock
 from aiohttp_socks import ProxyConnector
@@ -12,9 +14,11 @@ from contextlib import asynccontextmanager
 
 from lingvatrans.constants import (
     DEFAULT_BEARER_TOKEN,
+    CHROME_BEARER_TOKEN,
     DEFAULT_RAISE_EXCEPTION,
     TRANSLATE_URL,
     GET_LANGUAGES_URL,
+    CHROME_TRANSLATE_URL,
     LANGUAGES,
     LANGCODES,
     LANGNAMES,
@@ -59,9 +63,7 @@ def _normalize_lang(code: str) -> str:
 class Translator:
     """Lingvanex translation API client.
 
-    :param token: Bearer token for authentication.
-                  Defaults to the publicly known hardcoded token.
-                  Pass your own token to override.
+    :param token: Authentication token. Defaults to the platform's built-in token.
     :type token: str
 
     :param raise_exception: If True, raises exceptions on API errors
@@ -71,36 +73,62 @@ class Translator:
     :param timeout: aiohttp ClientTimeout object.
     :type timeout: aiohttp.ClientTimeout
 
+    :param platform: ``'web'`` (default) uses the B2B web API;
+                     ``'browserExtension'`` mimics the Chrome extension.
+    :type platform: str
+    
+    :param ssl: Whether to verify SSL certificates.  Defaults to True.
+    :type ssl: bool
+
     Basic usage::
 
         import asyncio
         from lingvatrans import Translator
 
         async def main():
+            # Web platform (default)
             async with Translator() as t:
                 result = await t.translate('Hello', dest='fr_FR')
                 print(result.text)          # 'Bonjour'
 
-                detected = await t.detect('Bonjour')
-                print(detected.lang)        # 'fr_FR'
+            # Chrome extension platform
+            async with Translator(platform='browserExtension') as t:
+                result = await t.translate('Bonjour', dest='en_US', src='fr_FR')
+                print(result.text)
 
         asyncio.run(main())
     """
 
     def __init__(
         self,
-        token: str = DEFAULT_BEARER_TOKEN,
+        token: str = None,
         raise_exception: bool = DEFAULT_RAISE_EXCEPTION,
         timeout: aiohttp.ClientTimeout = None,
         proxy: str = None,
         proxy_auth: tuple = None,
         connector_limit: int = 100,
+        platform: str = 'web',
+        ssl: bool = True,
     ):
-        # If the caller passes a raw token without 'Bearer ' prefix, add it
-        if not token.startswith('Bearer '):
-            token = 'Bearer ' + token
+        self.platform = platform
 
-        self._token = token
+        if platform == 'browserExtension':
+            if token is None:
+                token = CHROME_BEARER_TOKEN
+            # Extension token is sent as-is, no Bearer prefix
+            self._token = token
+            self._translate_url = CHROME_TRANSLATE_URL
+            self._session_uuid = str(_uuid_mod.uuid4())
+        else:
+            if token is None:
+                token = DEFAULT_BEARER_TOKEN
+            # Web platform uses Bearer prefix
+            if not token.startswith('Bearer '):
+                token = 'Bearer ' + token
+            self._token = token
+            self._translate_url = TRANSLATE_URL
+            self._session_uuid = None
+
         self.raise_exception = raise_exception
         self.timeout = timeout or aiohttp.ClientTimeout(total=30)
         self.connector_limit = connector_limit
@@ -109,6 +137,7 @@ class Translator:
         self._proxy_url = proxy
         self._use_proxy_connector = False
         self.rwlock = aiorwlock.RWLock(fast=True)
+        self.ssl = ssl
 
         connector = None
         if proxy is not None:
@@ -120,7 +149,7 @@ class Translator:
                 self.proxy_auth = aiohttp.BasicAuth(proxy_auth[0], proxy_auth[1]) if proxy_auth else None
 
         if connector is None:
-            connector = aiohttp.TCPConnector(limit=self.connector_limit)
+            connector = aiohttp.TCPConnector(limit=self.connector_limit, ssl=self.ssl)
 
         self.connector = connector
         self._session: aiohttp.ClientSession = aiohttp.ClientSession(
@@ -135,12 +164,16 @@ class Translator:
     # ------------------------------------------------------------------
 
     def _get_headers(self) -> dict:
-        return {'Authorization': self._token}
+        return {
+            'Authorization': self._token,
+            # Exclude brotli to avoid ClientPayloadError when aiohttp can't decode 'br'
+            'Accept-Encoding': 'gzip, deflate',
+        }
 
     async def _ensure_session(self):
         async with self.rwlock.writer_lock:
             if self._session is None or self._session.closed:
-                connector = aiohttp.TCPConnector(limit=self.connector_limit)
+                connector = aiohttp.TCPConnector(limit=self.connector_limit, ssl=self.ssl)
                 self.connector = connector
                 self._session = aiohttp.ClientSession(
                     connector=connector,
@@ -227,7 +260,7 @@ class Translator:
     # Public API
     # ------------------------------------------------------------------
 
-    async def translate(self, text: str, dest: str = 'en_US', src: str = 'auto') -> Translated:
+    async def translate(self, text: str | list, dest: str = 'en_US', src: str = 'auto') -> Translated:
         """Translate *text* from *src* language into *dest* language.
 
         :param text: Text to translate.
@@ -245,81 +278,139 @@ class Translator:
 
         await self._ensure_session()
 
-        payload = {'to': dest_code, 'text': text}
-        if src_code != 'auto':
-            payload['from'] = src_code
+        if self.platform == 'browserExtension':
+            payload = {
+                'to': dest_code,
+                'data': [text],
+                'platform': 'browserExtension',
+                'uuid': self._session_uuid,
+                'compact': True,
+                'enableTransliteration': False,
+            }
+            if src_code != 'auto':
+                payload['from'] = src_code
 
-        async with self._get_session() as session:
-            async with session.post(TRANSLATE_URL, data=payload, proxy=self.proxy, proxy_auth=self.proxy_auth) as resp:
-                status = resp.status
-                data = await resp.json(content_type=None)
+            async with self._get_session() as session:
+                async with session.post(
+                    self._translate_url, json=payload,
+                    proxy=self.proxy, proxy_auth=self.proxy_auth,
+                ) as resp:
+                    status = resp.status
+                    data = await resp.json(content_type=None)
 
-                if status != 200:
-                    if self.raise_exception:
-                        raise Exception(
-                            f'Lingvanex API returned status {status}: {data}'
-                        )
-                    return Translated(src=src, dest=dest, origin=text,
-                                      text='', extra_data=data)
+                    if status != 200:
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API returned status {status}: {data}')
+                        return Translated(src=src, dest=dest, origin=text, text='', extra_data=data)
 
-                if data.get('err'):
-                    if self.raise_exception:
-                        raise Exception(f'Lingvanex API error: {data["err"]}')
-                    return Translated(src=src, dest=dest, origin=text,
-                                      text='', extra_data=data)
+                    if data.get('err'):
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API error: {data["err"]}')
+                        return Translated(src=src, dest=dest, origin=text, text='', extra_data=data)
 
-                translated_text = data.get('result', '')
-                # API may return detected source language
-                detected_src = data.get('from', src_code)
-                if src_code == 'auto' and detected_src:
-                    src = detected_src
+                    result = data.get('result', '')
+                    translated_text = result[0] if isinstance(result, list) else result
+                    detected_src = data.get('from', src_code)
+                    if src_code == 'auto' and detected_src:
+                        src = detected_src
 
-                return Translated(
-                    src=src,
-                    dest=dest,
-                    origin=text,
-                    text=translated_text,
-                    extra_data=data,
-                )
+                    return Translated(src=src, dest=dest, origin=text, text=translated_text, extra_data=data)
 
-    async def detect(self, text: str) -> Detected:  # noqa: E302
+        else:
+            payload = {'to': dest_code, 'text': text}
+            if src_code != 'auto':
+                payload['from'] = src_code
+
+            async with self._get_session() as session:
+                async with session.post(
+                    self._translate_url, data=payload,
+                    proxy=self.proxy, proxy_auth=self.proxy_auth,
+                ) as resp:
+                    status = resp.status
+                    data = await resp.json(content_type=None)
+
+                    if status != 200:
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API returned status {status}: {data}')
+                        return Translated(src=src, dest=dest, origin=text, text='', extra_data=data)
+
+                    if data.get('err'):
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API error: {data["err"]}')
+                        return Translated(src=src, dest=dest, origin=text, text='', extra_data=data)
+
+                    translated_text = data.get('result', '')
+                    detected_src = data.get('from', src_code)
+                    if src_code == 'auto' and detected_src:
+                        src = detected_src
+
+                    return Translated(src=src, dest=dest, origin=text, text=translated_text, extra_data=data)
+
+    async def detect(self, text: str | list) -> Detected:  # noqa: E302
         """Detect the language of *text*.
 
-        Internally calls the translate endpoint with ``platform=dp`` and no
-        ``from`` parameter, as documented by the Lingvanex API.
-
         :param text: Text whose language should be detected.
-        :returns: :class:`~lingvatrans.models.Detected`
+        :returns: :class:`~lingvatrans.models.Detected` or list of :class:`~lingvatrans.models.Detected`
         """
         if isinstance(text, list):
             return [await self.detect(item) for item in text]
 
         await self._ensure_session()
 
-        payload = {'to': 'en_US', 'text': text}
-        url = TRANSLATE_URL + '?platform=dp'
+        if self.platform == 'browserExtension':
+            payload = {
+                'to': 'en_US',
+                'data': [text],
+                'platform': 'browserExtension',
+                'uuid': self._session_uuid,
+                'compact': True,
+                'enableTransliteration': False,
+            }
 
-        async with self._get_session() as session:
-            async with session.post(url, data=payload, proxy=self.proxy, proxy_auth=self.proxy_auth) as resp:
-                status = resp.status
-                data = await resp.json(content_type=None)
+            async with self._get_session() as session:
+                async with session.post(
+                    self._translate_url, json=payload,
+                    proxy=self.proxy, proxy_auth=self.proxy_auth,
+                ) as resp:
+                    status = resp.status
+                    data = await resp.json(content_type=None)
 
-                if status != 200:
-                    if self.raise_exception:
-                        raise Exception(
-                            f'Lingvanex API returned status {status}: {data}'
-                        )
-                    return Detected(lang='unknown', confidence=None)
+                    if status != 200:
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API returned status {status}: {data}')
+                        return Detected(lang='unknown', confidence=None)
 
-                if data.get('err'):
-                    if self.raise_exception:
-                        raise Exception(f'Lingvanex API error: {data["err"]}')
-                    return Detected(lang='unknown', confidence=None)
+                    if data.get('err'):
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API error: {data["err"]}')
+                        return Detected(lang='unknown', confidence=None)
 
-                lang = data.get('sourceLanguage') or data.get('from', 'unknown')
-                confidence = data.get('score', None)
+                    lang = data.get('sourceLanguage') or data.get('from', 'unknown')
+                    confidence = data.get('score', None)
+                    return Detected(lang=lang, confidence=confidence)
 
-                return Detected(lang=lang, confidence=confidence)
+        else:
+            payload = {'to': 'en_US', 'text': text}
+            url = self._translate_url + '?platform=dp'
+
+            async with self._get_session() as session:
+                async with session.post(url, data=payload, proxy=self.proxy, proxy_auth=self.proxy_auth) as resp:
+                    status = resp.status
+                    data = await resp.json(content_type=None)
+
+                    if status != 200:
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API returned status {status}: {data}')
+                        return Detected(lang='unknown', confidence=None)
+
+                    if data.get('err'):
+                        if self.raise_exception:
+                            raise Exception(f'Lingvanex API error: {data["err"]}')
+                        return Detected(lang='unknown', confidence=None)
+
+                    lang = data.get('sourceLanguage') or data.get('from', 'unknown')
+                    confidence = data.get('score', None)
+                    return Detected(lang=lang, confidence=confidence)
 
     async def get_languages(self) -> list:  # noqa: E302
         """Return the list of supported languages from the Lingvanex API.
